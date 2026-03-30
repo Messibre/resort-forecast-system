@@ -24,30 +24,58 @@ def get_supabase_client():
 
 
 def fetch_daily_occupancy(client) -> pd.DataFrame:
+    table_name = os.getenv("SUPABASE_OCCUPANCY_TABLE", "daily_occupancy")
+    date_col_override = os.getenv("SUPABASE_OCCUPANCY_DATE_COLUMN")
+    target_col_override = os.getenv("SUPABASE_OCCUPANCY_TARGET_COLUMN")
+
     response = (
-        client.table("daily_occupancy")
-        .select("date,occupied_rooms")
-        .order("date", desc=False)
+        client.table(table_name)
+        .select("*")
         .execute()
     )
 
     rows = response.data or []
     if not rows:
-        raise RuntimeError("No records found in daily_occupancy table")
+        raise RuntimeError(f"No records found in {table_name} table")
 
     df = pd.DataFrame(rows)
-    if "date" not in df.columns or "occupied_rooms" not in df.columns:
+
+    date_candidates = [
+        date_col_override,
+        "date",
+        "ds",
+        "booking_date",
+        "stay_date",
+    ]
+    target_candidates = [
+        target_col_override,
+        "occupied_rooms",
+        "occupancy",
+        "rooms_sold",
+        "demand",
+        "y",
+    ]
+
+    date_col = next((col for col in date_candidates if col and col in df.columns), None)
+    target_col = next(
+        (col for col in target_candidates if col and col in df.columns),
+        None,
+    )
+
+    if not date_col or not target_col:
         raise RuntimeError(
-            "daily_occupancy must provide 'date' and 'occupied_rooms' columns"
+            f"Could not infer date/target columns in {table_name}. "
+            f"Available columns: {sorted(df.columns.tolist())}. "
+            "Set SUPABASE_OCCUPANCY_DATE_COLUMN and SUPABASE_OCCUPANCY_TARGET_COLUMN."
         )
 
-    df = df.rename(columns={"date": "ds", "occupied_rooms": "y"})
+    df = df.rename(columns={date_col: "ds", target_col: "y"})
     df["ds"] = pd.to_datetime(df["ds"], errors="coerce")
     df["y"] = pd.to_numeric(df["y"], errors="coerce")
     df = df.dropna(subset=["ds", "y"]).sort_values("ds")
 
     if df.empty:
-        raise RuntimeError("daily_occupancy had no valid rows after cleaning")
+        raise RuntimeError(f"{table_name} had no valid rows after cleaning")
 
     return df[["ds", "y"]]
 
