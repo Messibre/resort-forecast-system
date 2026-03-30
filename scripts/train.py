@@ -43,15 +43,15 @@ def fetch_daily_occupancy(client) -> pd.DataFrame:
     date_candidates = [
         date_col_override,
         "date",
-        "ds",
-        "booking_date",
         "stay_date",
+        "booking_date",
+        "ds",
+        "created_at",
     ]
     target_candidates = [
         target_col_override,
-        "occupied_rooms",
-        "occupancy",
         "rooms_sold",
+        "occupancy",
         "demand",
         "y",
     ]
