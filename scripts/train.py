@@ -81,16 +81,38 @@ def fetch_daily_occupancy(client) -> pd.DataFrame:
 
 
 def fetch_events(client) -> pd.DataFrame:
-    response = client.table("events").select("date,name").execute()
-    rows = response.data or []
+    table_name = os.getenv("SUPABASE_EVENTS_TABLE", "events")
+    date_col_override = os.getenv("SUPABASE_EVENTS_DATE_COLUMN")
+    name_col_override = os.getenv("SUPABASE_EVENTS_NAME_COLUMN")
 
+    try:
+        response = client.table(table_name).select("*").execute()
+    except Exception as exc:
+        print(f"Warning: failed to fetch events from {table_name}: {exc}")
+        return pd.DataFrame(columns=["ds", "holiday", "lower_window", "upper_window"])
+
+    rows = response.data or []
     if not rows:
         return pd.DataFrame(columns=["ds", "holiday", "lower_window", "upper_window"])
 
     events = pd.DataFrame(rows)
-    events["ds"] = pd.to_datetime(events.get("date"), errors="coerce")
+
+    date_candidates = [date_col_override, "date", "ds", "event_date", "created_at"]
+    name_candidates = [name_col_override, "event_name", "name", "title", "event_type"]
+
+    date_col = next((col for col in date_candidates if col and col in events.columns), None)
+    name_col = next((col for col in name_candidates if col and col in events.columns), None)
+
+    if not date_col or not name_col:
+        print(
+            f"Warning: could not infer event date/name columns in {table_name}. "
+            f"Available columns: {sorted(events.columns.tolist())}. Skipping events."
+        )
+        return pd.DataFrame(columns=["ds", "holiday", "lower_window", "upper_window"])
+
+    events["ds"] = pd.to_datetime(events.get(date_col), errors="coerce")
     events["holiday"] = (
-        events.get("name")
+        events.get(name_col)
         .fillna("event")
         .astype(str)
         .str.strip()
