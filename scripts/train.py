@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+import re
 
 import joblib
 import pandas as pd
@@ -84,6 +85,8 @@ def fetch_events(client) -> pd.DataFrame:
     table_name = os.getenv("SUPABASE_EVENTS_TABLE", "events")
     date_col_override = os.getenv("SUPABASE_EVENTS_DATE_COLUMN")
     name_col_override = os.getenv("SUPABASE_EVENTS_NAME_COLUMN")
+    type_col_override = os.getenv("SUPABASE_EVENTS_TYPE_COLUMN")
+    impact_col_override = os.getenv("SUPABASE_EVENTS_IMPACT_COLUMN")
 
     try:
         response = client.table(table_name).select("*").execute()
@@ -98,10 +101,14 @@ def fetch_events(client) -> pd.DataFrame:
     events = pd.DataFrame(rows)
 
     date_candidates = [date_col_override, "date", "ds", "event_date", "created_at"]
-    name_candidates = [name_col_override, "event_name", "name", "title", "event_type"]
+    name_candidates = [name_col_override, "event_name", "name", "title"]
+    type_candidates = [type_col_override, "event_type", "type", "category"]
+    impact_candidates = [impact_col_override, "expected_impact", "impact", "priority"]
 
     date_col = next((col for col in date_candidates if col and col in events.columns), None)
     name_col = next((col for col in name_candidates if col and col in events.columns), None)
+    type_col = next((col for col in type_candidates if col and col in events.columns), None)
+    impact_col = next((col for col in impact_candidates if col and col in events.columns), None)
 
     if not date_col or not name_col:
         print(
@@ -110,20 +117,101 @@ def fetch_events(client) -> pd.DataFrame:
         )
         return pd.DataFrame(columns=["ds", "holiday", "lower_window", "upper_window"])
 
+    def slug(value: object) -> str:
+        text = str(value).strip().lower()
+        text = re.sub(r"[^a-z0-9]+", "_", text)
+        return text.strip("_") or "event"
+
     events["ds"] = pd.to_datetime(events.get(date_col), errors="coerce")
-    events["holiday"] = (
-        events.get(name_col)
-        .fillna("event")
-        .astype(str)
-        .str.strip()
-        .replace("", "event")
-        .apply(lambda x: f"event_{x.lower().replace(' ', '_')}")
-    )
-    events["lower_window"] = 0
-    events["upper_window"] = 0
+    event_name_series = events.get(name_col).fillna("event")
+    if type_col:
+        event_type_series = events.get(type_col).fillna("general")
+        events["holiday"] = [
+            f"event_{slug(t)}_{slug(n)}" for t, n in zip(event_type_series, event_name_series)
+        ]
+    else:
+        events["holiday"] = [f"event_{slug(n)}" for n in event_name_series]
+
+    # Wider windows for bigger expected impact to let Prophet learn spillover effects.
+    if impact_col:
+        impact_map = {
+            "low": 0,
+            "medium": 1,
+            "high": 2,
+        }
+        impact_labels = events.get(impact_col).fillna("low").astype(str).str.strip().str.lower()
+        window_sizes = impact_labels.map(impact_map).fillna(0).astype(int)
+        events["lower_window"] = -window_sizes
+        events["upper_window"] = window_sizes
+    else:
+        events["lower_window"] = 0
+        events["upper_window"] = 0
 
     events = events.dropna(subset=["ds", "holiday"])
     return events[["ds", "holiday", "lower_window", "upper_window"]]
+
+
+def fetch_feedback_actuals(client) -> pd.DataFrame:
+    table_name = os.getenv("SUPABASE_FEEDBACK_TABLE", "actual_vs_predicted")
+    date_col_override = os.getenv("SUPABASE_FEEDBACK_DATE_COLUMN")
+    actual_col_override = os.getenv("SUPABASE_FEEDBACK_ACTUAL_COLUMN")
+
+    try:
+        response = client.table(table_name).select("*").execute()
+    except Exception as exc:
+        print(f"Warning: failed to fetch feedback data from {table_name}: {exc}")
+        return pd.DataFrame(columns=["ds", "y"])
+
+    rows = response.data or []
+    if not rows:
+        return pd.DataFrame(columns=["ds", "y"])
+
+    feedback = pd.DataFrame(rows)
+    date_candidates = [date_col_override, "date", "ds", "created_at"]
+    actual_candidates = [
+        actual_col_override,
+        "actual_rooms_sold",
+        "actual",
+        "rooms_sold",
+        "y",
+    ]
+
+    date_col = next((col for col in date_candidates if col and col in feedback.columns), None)
+    actual_col = next((col for col in actual_candidates if col and col in feedback.columns), None)
+
+    if not date_col or not actual_col:
+        print(
+            f"Warning: could not infer feedback date/actual columns in {table_name}. "
+            f"Available columns: {sorted(feedback.columns.tolist())}. Skipping feedback data."
+        )
+        return pd.DataFrame(columns=["ds", "y"])
+
+    feedback = feedback.rename(columns={date_col: "ds", actual_col: "y"})
+    feedback["ds"] = pd.to_datetime(feedback["ds"], errors="coerce")
+    feedback["y"] = pd.to_numeric(feedback["y"], errors="coerce")
+    feedback = feedback.dropna(subset=["ds", "y"])
+    feedback = feedback.sort_values("ds")
+    return feedback[["ds", "y"]]
+
+
+def apply_feedback_adjustments(train_df: pd.DataFrame, feedback_df: pd.DataFrame) -> pd.DataFrame:
+    if feedback_df.empty:
+        return train_df
+
+    base = train_df.copy()
+    base["source_rank"] = 0
+
+    feedback = feedback_df.copy()
+    feedback["source_rank"] = 1
+
+    combined = pd.concat([base, feedback], ignore_index=True)
+    combined["ds"] = pd.to_datetime(combined["ds"], errors="coerce")
+    combined["y"] = pd.to_numeric(combined["y"], errors="coerce")
+    combined = combined.dropna(subset=["ds", "y"])
+    combined = combined.sort_values(["ds", "source_rank"])
+    combined = combined.drop_duplicates(subset=["ds"], keep="last")
+
+    return combined[["ds", "y"]].sort_values("ds")
 
 
 def load_static_holidays() -> pd.DataFrame:
@@ -198,6 +286,12 @@ def main() -> int:
 
     train_df = fetch_daily_occupancy(client)
     print(f"Loaded {len(train_df)} occupancy rows")
+
+    feedback_df = fetch_feedback_actuals(client)
+    print(f"Loaded {len(feedback_df)} feedback rows")
+
+    train_df = apply_feedback_adjustments(train_df, feedback_df)
+    print(f"Training rows after feedback adjustment: {len(train_df)}")
 
     static_holidays = load_static_holidays()
     print(f"Loaded {len(static_holidays)} static holiday rows")
